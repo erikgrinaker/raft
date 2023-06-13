@@ -59,7 +59,8 @@ func (c ConfChange) AsV2() ConfChangeV2 {
 			Type:   c.Type,
 			NodeID: c.NodeID,
 		}},
-		Context: c.Context,
+		Context:        c.Context,
+		CampaignNodeID: c.CampaignNodeID,
 	}
 }
 

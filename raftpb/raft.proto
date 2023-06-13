@@ -160,6 +160,10 @@ message ConfChange {
 	optional ConfChangeType  type    = 2 [(gogoproto.nullable) = false];
 	optional uint64          node_id = 3 [(gogoproto.nullable) = false, (gogoproto.customname) = "NodeID"];
 	optional bytes           context = 4;
+	// When applying the conf change, campaign the given node ID, skipping
+	// prevote. Primarily used when the leader removes itself, to designate an
+	// up-to-date follower that will assume leadership.
+	optional uint64          campaign_node_id = 5 [(gogoproto.nullable) = false, (gogoproto.customname) = "CampaignNodeID"];
 
 	// NB: this is used only by etcd to thread through a unique identifier.
 	// Ideally it should really use the Context instead. No counterpart to
@@ -210,4 +214,8 @@ message ConfChangeV2 {
 	optional ConfChangeTransition transition = 1 [(gogoproto.nullable) = false];
 	repeated ConfChangeSingle     changes =    2 [(gogoproto.nullable) = false];
 	optional bytes                context =    3;
+	// When applying the conf change, campaign the given node ID, skipping
+	// prevote. Primarily used when the leader removes itself, to designate an
+	// up-to-date follower that will assume leadership.
+	optional uint64               campaign_node_id = 4 [(gogoproto.nullable) = false, (gogoproto.customname) = "CampaignNodeID"];
 }

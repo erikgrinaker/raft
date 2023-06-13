@@ -54,6 +54,8 @@ func (env *InteractionEnv) handleAddNodes(t *testing.T, d datadriven.TestData) e
 				arg.Scan(t, i, &cfg.PreVote)
 			case "checkquorum":
 				arg.Scan(t, i, &cfg.CheckQuorum)
+			case "campaign-follower-on-leader-removal":
+				arg.Scan(t, i, &cfg.CampaignFollowerOnLeaderRemoval)
 			}
 		}
 	}

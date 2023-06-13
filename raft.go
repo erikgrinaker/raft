@@ -254,6 +254,11 @@ type Config struct {
 	// logical clock from assigning the timestamp and then forwarding the data
 	// to the leader.
 	DisableProposalForwarding bool
+
+	// CampaignFollowerOnLeaderRemoval will ask an up-to-date follower to campaign
+	// when the leader is removed through a conf change, specified in the conf
+	// change entry itself and executed on application.
+	CampaignFollowerOnLeaderRemoval bool
 }
 
 func (c *Config) validate() error {
@@ -381,8 +386,9 @@ type raft struct {
 	// randomizedElectionTimeout is a random number between
 	// [electiontimeout, 2 * electiontimeout - 1]. It gets reset
 	// when raft changes its state to follower or candidate.
-	randomizedElectionTimeout int
-	disableProposalForwarding bool
+	randomizedElectionTimeout       int
+	disableProposalForwarding       bool
+	campaignFollowerOnLeaderRemoval bool
 
 	tick func()
 	step stepFunc
@@ -407,20 +413,21 @@ func newRaft(c *Config) *raft {
 	}
 
 	r := &raft{
-		id:                        c.ID,
-		lead:                      None,
-		isLearner:                 false,
-		raftLog:                   raftlog,
-		maxMsgSize:                entryEncodingSize(c.MaxSizePerMsg),
-		maxUncommittedSize:        entryPayloadSize(c.MaxUncommittedEntriesSize),
-		prs:                       tracker.MakeProgressTracker(c.MaxInflightMsgs, c.MaxInflightBytes),
-		electionTimeout:           c.ElectionTick,
-		heartbeatTimeout:          c.HeartbeatTick,
-		logger:                    c.Logger,
-		checkQuorum:               c.CheckQuorum,
-		preVote:                   c.PreVote,
-		readOnly:                  newReadOnly(c.ReadOnlyOption),
-		disableProposalForwarding: c.DisableProposalForwarding,
+		id:                              c.ID,
+		lead:                            None,
+		isLearner:                       false,
+		raftLog:                         raftlog,
+		maxMsgSize:                      entryEncodingSize(c.MaxSizePerMsg),
+		maxUncommittedSize:              entryPayloadSize(c.MaxUncommittedEntriesSize),
+		prs:                             tracker.MakeProgressTracker(c.MaxInflightMsgs, c.MaxInflightBytes),
+		electionTimeout:                 c.ElectionTick,
+		heartbeatTimeout:                c.HeartbeatTick,
+		logger:                          c.Logger,
+		checkQuorum:                     c.CheckQuorum,
+		preVote:                         c.PreVote,
+		readOnly:                        newReadOnly(c.ReadOnlyOption),
+		disableProposalForwarding:       c.DisableProposalForwarding,
+		campaignFollowerOnLeaderRemoval: c.CampaignFollowerOnLeaderRemoval,
 	}
 
 	cfg, prs, err := confchange.Restore(confchange.Changer{
@@ -430,7 +437,7 @@ func newRaft(c *Config) *raft {
 	if err != nil {
 		panic(err)
 	}
-	assertConfStatesEquivalent(r.logger, cs, r.switchToConfig(cfg, prs))
+	assertConfStatesEquivalent(r.logger, cs, r.switchToConfig(cfg, prs, false))
 
 	if !IsEmptyHardState(hs) {
 		r.loadState(hs)
@@ -913,7 +920,7 @@ func (r *raft) hup(t CampaignType) {
 		r.logger.Warningf("%x is unpromotable and can not campaign", r.id)
 		return
 	}
-	if r.hasUnappliedConfChanges() {
+	if r.hasUnappliedConfChanges(false /* ignoreFirst */) {
 		r.logger.Warningf("%x cannot campaign at term %d since there are still pending configuration changes to apply", r.id, r.Term)
 		return
 	}
@@ -925,7 +932,7 @@ func (r *raft) hup(t CampaignType) {
 // errBreak is a sentinel error used to break a callback-based loop.
 var errBreak = errors.New("break")
 
-func (r *raft) hasUnappliedConfChanges() bool {
+func (r *raft) hasUnappliedConfChanges(ignoreFirst bool) bool {
 	if r.raftLog.applied >= r.raftLog.committed { // in fact applied == committed
 		return false
 	}
@@ -942,6 +949,10 @@ func (r *raft) hasUnappliedConfChanges() bool {
 	if err := r.raftLog.scan(lo, hi, pageSize, func(ents []pb.Entry) error {
 		for i := range ents {
 			if ents[i].Type == pb.EntryConfChange || ents[i].Type == pb.EntryConfChangeV2 {
+				if ignoreFirst {
+					ignoreFirst = false
+					continue
+				}
 				found = true
 				return errBreak
 			}
@@ -1228,6 +1239,28 @@ func stepLeader(r *raft, m pb.Message) error {
 				var ccc pb.ConfChange
 				if err := ccc.Unmarshal(e.Data); err != nil {
 					panic(err)
+				}
+				if ccc.Type == pb.ConfChangeRemoveNode && ccc.NodeID == r.id {
+					if r.campaignFollowerOnLeaderRemoval && ccc.CampaignNodeID == None {
+						var campaignID, match uint64
+						for _, id := range r.prs.VoterNodes() {
+							if id != r.id {
+								if p := r.prs.Progress[id]; p.State == tracker.StateReplicate {
+									if p.Match >= r.raftLog.committed && p.Match > match {
+										campaignID, match = id, p.Match
+									}
+								}
+							}
+						}
+						if campaignID != None {
+							r.logger.Infof("removing leader %x, requesting %x to campaign on removal", r.id, campaignID)
+							ccc.CampaignNodeID = campaignID
+							var err error
+							if e.Data, err = ccc.Marshal(); err != nil {
+								panic(err)
+							}
+						}
+					}
 				}
 				cc = ccc
 			} else if e.Type == pb.EntryConfChangeV2 {
@@ -1823,7 +1856,7 @@ func (r *raft) restore(s pb.Snapshot) bool {
 		panic(fmt.Sprintf("unable to restore config %+v: %s", cs, err))
 	}
 
-	assertConfStatesEquivalent(r.logger, cs, r.switchToConfig(cfg, prs))
+	assertConfStatesEquivalent(r.logger, cs, r.switchToConfig(cfg, prs, false))
 
 	pr := r.prs.Progress[r.id]
 	pr.MaybeUpdate(pr.Next - 1) // TODO(tbg): this is untested and likely unneeded
@@ -1859,7 +1892,20 @@ func (r *raft) applyConfChange(cc pb.ConfChangeV2) pb.ConfState {
 		panic(err)
 	}
 
-	return r.switchToConfig(cfg, prs)
+	var campaign bool
+	if cc.CampaignNodeID != r.id {
+		// not designated campaigner
+	} else if r.state == StateLeader {
+		// already leader, nothing to do
+	} else if !r.promotable() {
+		r.logger.Warningf("%x is unpromotable and can not campaign", r.id)
+	} else if r.hasUnappliedConfChanges(true /* ignoreFirst */) {
+		r.logger.Warningf("%x cannot campaign at term %d since there are still pending configuration changes to apply", r.id, r.Term)
+	} else {
+		campaign = true
+	}
+
+	return r.switchToConfig(cfg, prs, campaign)
 }
 
 // switchToConfig reconfigures this node to use the provided configuration. It
@@ -1868,7 +1914,9 @@ func (r *raft) applyConfChange(cc pb.ConfChangeV2) pb.ConfState {
 // requirements.
 //
 // The inputs usually result from restoring a ConfState or applying a ConfChange.
-func (r *raft) switchToConfig(cfg tracker.Config, prs tracker.ProgressMap) pb.ConfState {
+func (r *raft) switchToConfig(
+	cfg tracker.Config, prs tracker.ProgressMap, campaign bool,
+) pb.ConfState {
 	r.prs.Config = cfg
 	r.prs.Progress = prs
 
@@ -1880,16 +1928,17 @@ func (r *raft) switchToConfig(cfg tracker.Config, prs tracker.ProgressMap) pb.Co
 	// node is removed.
 	r.isLearner = ok && pr.IsLearner
 
+	// If requested, explicitly campaign (skipping prevote). The caller must have
+	// verified that the node is eligible to campaign.
+	if campaign {
+		r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
+		r.campaign(campaignTransfer)
+	}
+
 	if (!ok || r.isLearner) && r.state == StateLeader {
 		// This node is leader and was removed or demoted. We prevent demotions
 		// at the time writing but hypothetically we handle them the same way as
 		// removing the leader: stepping down into the next Term.
-		//
-		// TODO(tbg): step down (for sanity) and ask follower with largest Match
-		// to TimeoutNow (to avoid interruption). This might still drop some
-		// proposals but it's better than nothing.
-		//
-		// TODO(tbg): test this branch. It is untested at the time of writing.
 		return cs
 	}
 
